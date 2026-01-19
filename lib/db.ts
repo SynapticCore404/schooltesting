@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
-import { sql } from '@vercel/postgres'
+import { createPool, createClient, type VercelPool, type VercelClient } from '@vercel/postgres'
 import type {
   DB,
   Test,
@@ -25,7 +25,34 @@ const fallbackDataDir = path.join(tmpBaseDir, 'schooltestingapp-data')
 let DATA_DIR = process.env.VERCEL ? fallbackDataDir : primaryDataDir
 let DB_PATH = path.join(DATA_DIR, 'db.json')
 export const MAX_VIOLATIONS = 0
-const USE_POSTGRES = !!process.env.DATABASE_URL
+const pgConnectionString =
+  process.env.POSTGRES_URL ||
+  process.env.DATABASE_URL ||
+  process.env.POSTGRES_PRISMA_URL ||
+  process.env.POSTGRES_URL_NON_POOLING ||
+  null
+const USE_POSTGRES = !!pgConnectionString
+
+let pgPool: VercelPool | null = null
+let pgClient: VercelClient | null = null
+let clientConnected = false
+
+async function getPgSql() {
+  if (!USE_POSTGRES || !pgConnectionString) return null
+  if (pgPool) return pgPool.sql.bind(pgPool)
+  if (pgClient && clientConnected) return pgClient.sql.bind(pgClient)
+
+  const isPooled = pgConnectionString.includes('-pooler.') || pgConnectionString.includes('localhost')
+  if (isPooled) {
+    pgPool = createPool({ connectionString: pgConnectionString })
+    return pgPool.sql.bind(pgPool)
+  }
+
+  pgClient = createClient({ connectionString: pgConnectionString })
+  await pgClient.connect()
+  clientConnected = true
+  return pgClient.sql.bind(pgClient)
+}
 
 async function ensureDataDir() {
   try {
@@ -42,6 +69,8 @@ async function ensureDataDir() {
 }
 
 async function ensurePgStore() {
+  const sql = await getPgSql()
+  if (!sql) throw new Error('Postgres connection is not configured')
   await sql`CREATE TABLE IF NOT EXISTS app_state (id text PRIMARY KEY, data jsonb NOT NULL)`
 }
 
@@ -88,6 +117,8 @@ async function readDB(): Promise<DB> {
   }
 
   await ensurePgStore()
+  const sql = await getPgSql()
+  if (!sql) throw new Error('Postgres connection is not configured')
   const { rows } = await sql<{ data: DB }>`SELECT data FROM app_state WHERE id = 'main' LIMIT 1`
   if (!rows || rows.length === 0 || !rows[0]?.data) {
     const initial = defaultDB()
@@ -113,6 +144,8 @@ async function writeDB(db: DB) {
   }
   await ensurePgStore()
   const dataJson = JSON.stringify(db)
+  const sql = await getPgSql()
+  if (!sql) throw new Error('Postgres connection is not configured')
   await sql`INSERT INTO app_state (id, data) VALUES ('main', ${dataJson}::jsonb) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`
 }
 
