@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
+import { sql } from '@vercel/postgres'
 import type {
   DB,
   Test,
@@ -24,12 +25,12 @@ const fallbackDataDir = path.join(tmpBaseDir, 'schooltestingapp-data')
 let DATA_DIR = process.env.VERCEL ? fallbackDataDir : primaryDataDir
 let DB_PATH = path.join(DATA_DIR, 'db.json')
 export const MAX_VIOLATIONS = 0
+const USE_POSTGRES = !!process.env.DATABASE_URL
 
 async function ensureDataDir() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true })
   } catch (err: unknown) {
-    // Fall back to tmp in read-only environments like Vercel
     if (DATA_DIR !== fallbackDataDir) {
       DATA_DIR = fallbackDataDir
       DB_PATH = path.join(DATA_DIR, 'db.json')
@@ -40,15 +41,8 @@ async function ensureDataDir() {
   }
 }
 
-async function ensureDB() {
-  try {
-    await ensureDataDir()
-    await fs.access(DB_PATH)
-  } catch (err) {
-    await ensureDataDir()
-    const initial = defaultDB()
-    await fs.writeFile(DB_PATH, JSON.stringify(initial, null, 2), 'utf-8')
-  }
+async function ensurePgStore() {
+  await sql`CREATE TABLE IF NOT EXISTS app_state (id text PRIMARY KEY, data jsonb NOT NULL)`
 }
 
 function defaultDB(): DB {
@@ -65,38 +59,61 @@ function normalizeDB(db: DB): DB {
 }
 
 async function readDB(): Promise<DB> {
-  await ensureDB()
-  const raw = await fs.readFile(DB_PATH, 'utf-8')
-  if (!raw.trim()) {
-    const initial = defaultDB()
-    await writeDB(initial)
-    return initial
-  }
-  try {
-    const parsed = JSON.parse(raw) as DB
-    return normalizeDB(parsed)
-  } catch {
-    const badPath = `${DB_PATH}.bad-${Date.now()}`
+  if (!USE_POSTGRES) {
+    await ensureDataDir()
     try {
-      await fs.rename(DB_PATH, badPath)
-    } catch {}
+      await fs.access(DB_PATH)
+    } catch {
+      const initial = defaultDB()
+      await fs.writeFile(DB_PATH, JSON.stringify(initial, null, 2), 'utf-8')
+    }
+    const raw = await fs.readFile(DB_PATH, 'utf-8')
+    if (!raw.trim()) {
+      const initial = defaultDB()
+      await writeDB(initial)
+      return initial
+    }
+    try {
+      const parsed = JSON.parse(raw) as DB
+      return normalizeDB(parsed)
+    } catch {
+      const badPath = `${DB_PATH}.bad-${Date.now()}`
+      try {
+        await fs.rename(DB_PATH, badPath)
+      } catch {}
+      const initial = defaultDB()
+      await writeDB(initial)
+      return initial
+    }
+  }
+
+  await ensurePgStore()
+  const { rows } = await sql<{ data: DB }>`SELECT data FROM app_state WHERE id = 'main' LIMIT 1`
+  if (!rows || rows.length === 0 || !rows[0]?.data) {
     const initial = defaultDB()
     await writeDB(initial)
     return initial
   }
+  return normalizeDB(rows[0].data)
 }
 
 async function writeDB(db: DB) {
-  const tmpPath = `${DB_PATH}.tmp`
-  await fs.writeFile(tmpPath, JSON.stringify(db, null, 2), 'utf-8')
-  try {
-    await fs.rename(tmpPath, DB_PATH)
-  } catch {
+  if (!USE_POSTGRES) {
+    const tmpPath = `${DB_PATH}.tmp`
+    await fs.writeFile(tmpPath, JSON.stringify(db, null, 2), 'utf-8')
     try {
-      await fs.unlink(DB_PATH)
-    } catch {}
-    await fs.rename(tmpPath, DB_PATH)
+      await fs.rename(tmpPath, DB_PATH)
+    } catch {
+      try {
+        await fs.unlink(DB_PATH)
+      } catch {}
+      await fs.rename(tmpPath, DB_PATH)
+    }
+    return
   }
+  await ensurePgStore()
+  const dataJson = JSON.stringify(db)
+  await sql`INSERT INTO app_state (id, data) VALUES ('main', ${dataJson}::jsonb) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`
 }
 
 export async function listTests(): Promise<TestMeta[]> {
