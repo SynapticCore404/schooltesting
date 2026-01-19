@@ -37,6 +37,8 @@ let pgPool: VercelPool | null = null
 let pgClient: VercelClient | null = null
 let clientConnected = false
 
+type ClientWithConnect = VercelClient & { connect: () => Promise<void> }
+
 async function getPgSql() {
   if (!USE_POSTGRES || !pgConnectionString) return null
   if (pgPool) return pgPool.sql.bind(pgPool)
@@ -48,10 +50,11 @@ async function getPgSql() {
     return pgPool.sql.bind(pgPool)
   }
 
-  pgClient = createClient({ connectionString: pgConnectionString })
-  await pgClient.connect()
+  const client = createClient({ connectionString: pgConnectionString }) as ClientWithConnect
+  await client.connect()
+  pgClient = client
   clientConnected = true
-  return pgClient.sql.bind(pgClient)
+  return client.sql.bind(client)
 }
 
 async function ensureDataDir() {
